@@ -1,3 +1,5 @@
+//go:build !nowebrtc
+
 package torrent
 
 import (

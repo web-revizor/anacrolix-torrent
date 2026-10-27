@@ -1,7 +1,10 @@
+//go:build !nowebrtc
+
 package torrent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	netHttp "net/http"
@@ -48,7 +51,7 @@ type websocketTrackers struct {
 	Proxy                      httpTracker.ProxyFunc
 	DialContext                func(ctx context.Context, network, addr string) (net.Conn, error)
 	WebsocketTrackerHttpHeader func() netHttp.Header
-	ICEServers                 []webrtc.ICEServer
+	ICEServers                 []ICEServer
 	callbacks                  *Callbacks
 }
 
@@ -136,4 +139,74 @@ func (me *websocketTrackers) Get(url string, infoHash [20]byte) (*webtorrent.Tra
 			delete(me.clients, url)
 		}
 	}
+}
+
+func (cl *Client) initWebsocketTrackers() {
+	cl.websocketTrackers = websocketTrackers{
+		PeerId: cl.peerID,
+		Logger: cl.logger.WithNames("websocketTrackers"),
+		GetAnnounceRequest: func(
+			event tracker.AnnounceEvent, infoHash [20]byte,
+		) (
+			tracker.AnnounceRequest, error,
+		) {
+			cl.lock()
+			defer cl.unlock()
+			t, ok := cl.torrentsByShortHash[infoHash]
+			if !ok {
+				return tracker.AnnounceRequest{}, errors.New("torrent not tracked by client")
+			}
+			return t.announceRequest(event, infoHash), nil
+		},
+		Proxy:                      cl.config.HTTPProxy,
+		WebsocketTrackerHttpHeader: cl.config.WebsocketTrackerHttpHeader,
+		ICEServers:                 cl.ICEServers(),
+		DialContext:                cl.config.TrackerDialContext,
+		callbacks:                  &cl.config.Callbacks,
+		OnConn: func(dc webtorrent.DataChannelConn, dcc webtorrent.DataChannelContext) {
+			cl.lock()
+			defer cl.unlock()
+			t, ok := cl.torrentsByShortHash[dcc.InfoHash]
+			if !ok {
+				cl.logger.WithDefaultLevel(log.Warning).Printf(
+					"got webrtc conn for unloaded torrent with infohash %x",
+					dcc.InfoHash,
+				)
+				dc.Close()
+				return
+			}
+			go t.onWebRtcConn(dc, dcc)
+		},
+	}
+}
+
+func (t *Torrent) startWebsocketAnnouncer(u url.URL, shortInfohash [20]byte) torrentTrackerAnnouncer {
+	wtc, release := t.cl.websocketTrackers.Get(u.String(), shortInfohash)
+	// This needs to run before the Torrent is dropped from the Client, to prevent a new
+	// webtorrent.TrackerClient for the same info hash before the old one is cleaned up.
+	t.onClose = append(t.onClose, release)
+	wst := websocketTrackerStatus{u, wtc}
+	go func() {
+		err := wtc.Announce(tracker.Started, shortInfohash)
+		if err != nil {
+			level := log.Warning
+			if t.closed.IsSet() {
+				level = log.Debug
+			}
+			t.logger.Levelf(level, "error doing initial announce to %q: %v", u.String(), err)
+		}
+	}()
+	return wst
+}
+
+type webRtcStatsReports map[string]webrtc.StatsReport
+
+func (t *Torrent) GetWebRtcPeerConnStats() map[string]webRtcStatsReports {
+	stats := make(map[string]webRtcStatsReports)
+	trackersMap := t.cl.websocketTrackers.clients
+	for i, trackerClient := range trackersMap {
+		ts := trackerClient.RtcPeerConnStats()
+		stats[i] = ts
+	}
+	return stats
 }
